@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"google.golang.org/protobuf/proto"
@@ -67,14 +68,26 @@ func (c *commandFsMetaCat) Do(args []string, commandEnv *CommandEnv, writer io.W
 
 		filer.ProtoToText(writer, respLookupEntry.Entry)
 
+		writeHumanReadableAtime(writer, respLookupEntry.Entry)
+
 		bytes, _ := proto.Marshal(respLookupEntry.Entry)
 		gzippedBytes, _ := util.GzipData(bytes)
-		// zstdBytes, _ := util.ZstdData(bytes)
-		// fmt.Fprintf(writer, "chunks %d meta size: %d gzip:%d zstd:%d\n", len(respLookupEntry.Entry.GetChunks()), len(bytes), len(gzippedBytes), len(zstdBytes))
 		fmt.Fprintf(writer, "chunks %d meta size: %d gzip:%d\n", len(respLookupEntry.Entry.GetChunks()), len(bytes), len(gzippedBytes))
 
 		return nil
 
 	})
 
+}
+
+func writeHumanReadableAtime(writer io.Writer, entry *filer_pb.Entry) {
+	attrs := entry.GetAttributes()
+	if attrs == nil {
+		return
+	}
+	if attrs.Atime == 0 {
+		fmt.Fprintln(writer, "atime: (unset; falls back to mtime)")
+		return
+	}
+	fmt.Fprintf(writer, "atime: %s\n", time.Unix(attrs.Atime, int64(attrs.AtimeNs)).UTC().Format(time.RFC3339Nano))
 }
