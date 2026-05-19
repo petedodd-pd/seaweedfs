@@ -24,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/atime"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
@@ -149,8 +150,7 @@ type WFS struct {
 	filerClient          *wdclient.FilerClient // Cached volume location client
 	refreshMu            sync.Mutex
 	refreshingDirs       map[util.FullPath]struct{}
-	atimeMu              sync.Mutex
-	atimeMap             map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	atimeToucher         *atime.Toucher
 	dirMtimeMu           sync.Mutex
 	dirMtimeMap          map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
 	entryValidSec        uint64 // kernel FUSE entry cache TTL in seconds
@@ -243,7 +243,6 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		hardLinkLockTable: util.NewLockTable[string](),
 		posixLocks:        NewPosixLockTable(),
 		refreshingDirs:    make(map[util.FullPath]struct{}),
-		atimeMap:          make(map[uint64]time.Time, 8192),
 		openMtimeCache:    make(map[uint64][2]int64, 8192),
 		dirMtimeMap:       make(map[uint64]time.Time, 1024),
 		entryValidSec:    1,
@@ -260,6 +259,8 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		wfs.entryValidSec = 10
 		wfs.attrValidSec = 10
 	}
+
+	wfs.atimeToucher = wfs.newAtimeToucher()
 
 	if option.EnableDistributedLock && !option.WritebackCache && len(option.FilerAddresses) > 0 {
 		wfs.lockClient = cluster.NewLockClient(option.GrpcDialOption, option.FilerAddresses[0])

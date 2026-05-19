@@ -27,7 +27,6 @@ func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 	if status == fuse.OK {
 		out.AttrValid = wfs.attrValidSec
 		wfs.setAttrByPbEntry(&out.Attr, inode, entry, true)
-		wfs.applyInMemoryAtime(&out.Attr, inode)
 		if entry.IsDirectory {
 			wfs.applyInMemoryDirMtime(&out.Attr, inode)
 			if wfs.option.PosixDirNlink {
@@ -42,7 +41,6 @@ func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse
 			fhActiveLock := wfs.fhLockTable.AcquireLock("GetAttr", fh.fh, util.SharedLock)
 			wfs.setAttrByPbEntry(&out.Attr, inode, fh.entry.GetEntry(), true)
 			wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
-			wfs.applyInMemoryAtime(&out.Attr, inode)
 			out.Nlink = 0
 			return fuse.OK
 		}
@@ -147,7 +145,8 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	if atime, ok := input.GetATime(); ok {
-		wfs.setAtime(input.NodeId, atime)
+		entry.Attributes.Atime = atime.Unix()
+		entry.Attributes.AtimeNs = int32(atime.Nanosecond())
 	}
 
 	if mtime, ok := input.GetMTime(); ok {
@@ -166,7 +165,6 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		out.Attr.Size = size
 	}
 	wfs.setAttrByPbEntry(&out.Attr, input.NodeId, entry, !includeSize)
-	wfs.applyInMemoryAtime(&out.Attr, input.NodeId)
 
 	if fh != nil {
 		fh.dirtyMetadata = true
@@ -216,9 +214,13 @@ func (wfs *WFS) setAttrByPbEntry(out *fuse.Attr, inode uint64, entry *filer_pb.E
 		out.Ctime = uint64(entry.Attributes.Mtime)
 		out.Ctimensec = uint32(entry.Attributes.MtimeNs)
 	}
-	out.Atime = uint64(entry.Attributes.Mtime)
-	out.Atimensec = uint32(entry.Attributes.MtimeNs)
-	// In-memory atime overlay is applied by the caller via applyInMemoryAtime.
+	if entry.Attributes.Atime != 0 {
+		out.Atime = uint64(entry.Attributes.Atime)
+		out.Atimensec = uint32(entry.Attributes.AtimeNs)
+	} else {
+		out.Atime = uint64(entry.Attributes.Mtime)
+		out.Atimensec = uint32(entry.Attributes.MtimeNs)
+	}
 	out.Mode = toSyscallMode(os.FileMode(entry.Attributes.FileMode))
 	if entry.IsDirectory {
 		out.Nlink = 2
@@ -240,8 +242,13 @@ func (wfs *WFS) setAttrByFilerEntry(out *fuse.Attr, inode uint64, entry *filer.E
 	}
 	out.Blocks = (out.Size + blockSize - 1) / blockSize
 	setBlksize(out, blockSize)
-	out.Atime = uint64(entry.Attr.Mtime.Unix())
-	out.Atimensec = uint32(entry.Attr.Mtime.Nanosecond())
+	if !entry.Attr.Atime.IsZero() {
+		out.Atime = uint64(entry.Attr.Atime.Unix())
+		out.Atimensec = uint32(entry.Attr.Atime.Nanosecond())
+	} else {
+		out.Atime = uint64(entry.Attr.Mtime.Unix())
+		out.Atimensec = uint32(entry.Attr.Mtime.Nanosecond())
+	}
 	out.Mtime = uint64(entry.Attr.Mtime.Unix())
 	out.Mtimensec = uint32(entry.Attr.Mtime.Nanosecond())
 	if !entry.Attr.Ctime.IsZero() {
@@ -345,33 +352,6 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 		}
 	}
 	wfs.dirMtimeMu.Unlock()
-}
-
-const atimeMapMaxSize = 8192
-
-// setAtime stores an in-memory atime for an inode. The map is bounded;
-// when full, a random entry is evicted.
-func (wfs *WFS) setAtime(inode uint64, t time.Time) {
-	wfs.atimeMu.Lock()
-	defer wfs.atimeMu.Unlock()
-	if len(wfs.atimeMap) >= atimeMapMaxSize {
-		// evict one random entry
-		for k := range wfs.atimeMap {
-			delete(wfs.atimeMap, k)
-			break
-		}
-	}
-	wfs.atimeMap[inode] = t
-}
-
-// applyInMemoryAtime overlays the in-memory atime onto a fuse.Attr if present.
-func (wfs *WFS) applyInMemoryAtime(out *fuse.Attr, inode uint64) {
-	wfs.atimeMu.Lock()
-	if t, ok := wfs.atimeMap[inode]; ok {
-		out.Atime = uint64(t.Unix())
-		out.Atimensec = uint32(t.Nanosecond())
-	}
-	wfs.atimeMu.Unlock()
 }
 
 // applyDirNlink sets nlink = 2 + number_of_subdirectories for a directory.
