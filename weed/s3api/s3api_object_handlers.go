@@ -970,6 +970,9 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			if written > 0 {
 				BucketTrafficSent(int64(written), r)
 			}
+			if err == nil {
+				s3a.bumpAtime(r.Context(), bucket, object)
+			}
 			return err
 		}
 		// Non-range request for inline content
@@ -978,6 +981,9 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		written, err := w.Write(entry.Content)
 		if written > 0 {
 			BucketTrafficSent(int64(written), r)
+		}
+		if err == nil {
+			s3a.bumpAtime(r.Context(), bucket, object)
 		}
 		return err
 	}
@@ -1021,6 +1027,7 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			// Empty object - set headers and write status
 			s3a.setResponseHeaders(w, r, entry, totalSize)
 			w.WriteHeader(http.StatusOK)
+			s3a.bumpAtime(r.Context(), bucket, object)
 			return nil
 		}
 	}
@@ -1134,6 +1141,7 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		return newStreamErrorWithResponse(err)
 	}
 	glog.V(4).Infof("streamFromVolumeServers: streamFn completed successfully, wrote %d bytes", cw.written)
+	s3a.bumpAtime(r.Context(), bucket, object)
 	return nil
 }
 
@@ -1285,6 +1293,7 @@ func (s3a *S3ApiServer) streamFromVolumeServersWithSSE(w http.ResponseWriter, r 
 			// Error after WriteHeader - response already written
 			return newStreamErrorWithResponse(err)
 		}
+		s3a.bumpAtime(r.Context(), bucket, object)
 		return nil
 	}
 
@@ -1437,6 +1446,7 @@ func (s3a *S3ApiServer) streamFromVolumeServersWithSSE(w http.ResponseWriter, r 
 		return newStreamErrorWithResponse(copyErr)
 	}
 	glog.V(3).Infof("Full object request: copied %d bytes", copied)
+	s3a.bumpAtime(r.Context(), bucket, object)
 	return nil
 }
 

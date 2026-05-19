@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/atime"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -83,10 +84,11 @@ func NewWebDavServer(option *WebDavOption) (ws *WebDavServer, err error) {
 // adapted from https://github.com/mattn/davfs/blob/master/plugin/mysql/mysql.go
 
 type WebDavFileSystem struct {
-	option      *WebDavOption
-	chunkCache  *chunk_cache.TieredChunkCache
-	readerCache *filer.ReaderCache
-	signature   int32
+	option       *WebDavOption
+	chunkCache   *chunk_cache.TieredChunkCache
+	readerCache  *filer.ReaderCache
+	signature    int32
+	atimeToucher *atime.Toucher
 }
 
 type FileInfo struct {
@@ -138,6 +140,19 @@ func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 		signature:  util.RandomInt32(),
 	}
 	t.readerCache = filer.NewReaderCache(32, chunkCache, filer.LookupFn(t))
+	t.atimeToucher = atime.NewToucher(func(ctx context.Context, dir, name string, atimeNs int64) {
+		err := t.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+			_, touchErr := client.TouchAccessTime(ctx, &filer_pb.TouchAccessTimeRequest{
+				Directory:     dir,
+				Name:          name,
+				ClientAtimeNs: atimeNs,
+			})
+			return touchErr
+		})
+		if err != nil {
+			glog.V(3).Infof("webdav TouchAccessTime %s/%s: %v", dir, name, err)
+		}
+	})
 	return t, nil
 }
 
@@ -554,6 +569,11 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 
 	if err != nil && err != io.EOF {
 		glog.Errorf("file read %s: %v", f.name, err)
+	}
+
+	if readSize > 0 && (err == nil || err == io.EOF) {
+		dir, name := util.FullPath(f.name).DirAndName()
+		f.fs.atimeToucher.Bump(f.ctx, dir, name)
 	}
 
 	return

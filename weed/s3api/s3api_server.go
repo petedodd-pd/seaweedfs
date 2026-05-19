@@ -32,6 +32,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/atime"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
@@ -104,6 +105,8 @@ type S3ApiServer struct {
 
 	versionsHealQueue      *versionsHealQueue
 	versionsReconcilerStop func()
+
+	atimeToucher *atime.Toucher
 }
 
 type objectWriteLock interface {
@@ -261,6 +264,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		cipher:                option.Cipher,
 		readerCache:           readerCache,
 	}
+	s3ApiServer.atimeToucher = s3ApiServer.newAtimeToucher()
 
 	if len(option.Filers) > 0 {
 		objectWriteLockClient := cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])

@@ -193,7 +193,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
+	rangeErr := ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
 		if offset+size <= int64(len(entry.Content)) {
 			return func(writer io.Writer) error {
 				_, err := writer.Write(entry.Content[offset : offset+size])
@@ -251,6 +251,9 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return err
 		}, nil
 	})
+	if rangeErr == nil {
+		fs.bumpAtimeForEntry(ctx, entry)
+	}
 }
 
 func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
