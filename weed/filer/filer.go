@@ -90,7 +90,7 @@ type Filer struct {
 	EmptyFolderCleanupDelay       time.Duration
 	persistedLogCache             *persistedLogCache
 	metaLogInflight               metaLogInflight
-	remoteTombstones              *remoteDeletionTombstones
+	remoteTombstones              *remoteDeletionTombstoneMounts
 	// EntryLockTable serializes mutations per entry path. The filer server
 	// holds it across local read-modify-write mutations and the meta
 	// aggregator across a replayed peer change's check-and-apply, so the two
@@ -147,7 +147,7 @@ func NewFiler(masters pb.ServerDiscovery, dialOptions *DialOptions, filerHost pb
 		deletionLedgerFlush: make(chan struct{}, 1),
 		DeletionRetryQueue:  NewDeletionRetryQueue(),
 		persistedLogCache:   newPersistedLogCache(persistedLogCacheMaxBytes),
-		remoteTombstones:    newRemoteDeletionTombstones(),
+		remoteTombstones:    newRemoteDeletionTombstoneMounts(),
 		EntryLockTable:      util.NewLockTable[util.FullPath](),
 	}
 	f.flushCtx, f.flushCancel = context.WithCancel(context.Background())

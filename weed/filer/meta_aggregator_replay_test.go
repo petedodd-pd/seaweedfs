@@ -946,7 +946,7 @@ func TestReplayDirectoryDeleteSweepsRemoteObjects(t *testing.T) {
 	if len(stub.deleteCalls) != 1 || stub.deleteCalls[0].Path != "/d/f.txt" {
 		t.Fatalf("expected one remote delete of /d/f.txt, got %v", stub.deleteCalls)
 	}
-	if got := f.remoteTombstones.dirs["/buckets/mybucket/d"]; got.commitTsNs != event.TsNs {
+	if got := f.remoteTombstones.table("/buckets/mybucket", false).dirs["/buckets/mybucket/d"]; got.commitTsNs != event.TsNs {
 		t.Fatalf("dir tombstone stamped %+v, want the event ts %d", got, event.TsNs)
 	}
 }
@@ -1004,8 +1004,8 @@ func TestReplayDirectoryDeleteKeepRemoteObjects(t *testing.T) {
 	if len(stub.deleteCalls) != 0 {
 		t.Fatalf("metadata-only delete must not touch remote objects, got %v", stub.deleteCalls)
 	}
-	if len(f.remoteTombstones.files)+len(f.remoteTombstones.dirs) != 0 {
-		t.Fatalf("metadata-only delete must not record tombstones, got %v", f.remoteTombstones.dirs)
+	if tombs := f.remoteTombstones.table("/buckets/mybucket", false); tombs != nil && len(tombs.files)+len(tombs.dirs) != 0 {
+		t.Fatalf("metadata-only delete must not record tombstones, got %v", tombs.dirs)
 	}
 }
 

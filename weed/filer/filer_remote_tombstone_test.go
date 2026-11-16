@@ -173,18 +173,19 @@ func TestMaybeLazyFetchFromRemote_FullTableKeepsTheFetchOff(t *testing.T) {
 		},
 	}
 	f, _ := newMountedTestFiler(t, storageType, stub, 0)
+	tombs := f.remoteTombstones.table("/buckets/mybucket", true)
 	remoteDeletionTombstoneLimit = 2
 	t.Cleanup(func() { remoteDeletionTombstoneLimit = defaultRemoteDeletionTombstoneLimit })
 
 	now := time.Now().UnixNano()
 	f.noteRemoteDeletion("/buckets/mybucket/dir/a.txt", false, now)
 	f.noteRemoteDeletion("/buckets/mybucket/dir/b.txt", false, now)
-	assert.False(t, f.remoteTombstones.isFull())
+	assert.False(t, tombs.isFull())
 
 	// the third delete does not fit: from here every path may be a pending
 	// delete, so no lookup miss consults the remote
 	f.noteRemoteDeletion("/buckets/mybucket/dir/c.txt", false, now)
-	assert.True(t, f.remoteTombstones.isFull())
+	assert.True(t, tombs.isFull())
 	entry, err := f.maybeLazyFetchFromRemote(context.Background(), "/buckets/mybucket/dir/other.txt")
 	require.NoError(t, err)
 	assert.Nil(t, entry)
@@ -192,8 +193,8 @@ func TestMaybeLazyFetchFromRemote_FullTableKeepsTheFetchOff(t *testing.T) {
 
 	// room again once a recorded delete lifts, but the unrecorded delete of
 	// c.txt has no event to confirm it: the fetch stays off until the TTL
-	f.remoteTombstones.drop("/buckets/mybucket/dir/a.txt", now)
-	assert.True(t, f.remoteTombstones.isFull())
+	tombs.drop("/buckets/mybucket/dir/a.txt", now)
+	assert.True(t, tombs.isFull())
 	entry, err = f.maybeLazyFetchFromRemote(context.Background(), "/buckets/mybucket/dir/other.txt")
 	require.NoError(t, err)
 	assert.Nil(t, entry)
@@ -205,7 +206,7 @@ func TestMaybeLazyFetchFromRemote_FullTableKeepsTheFetchOff(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.NotZero(t, stub.statCalls)
-	assert.False(t, f.remoteTombstones.isFull())
+	assert.False(t, tombs.isFull())
 }
 
 func TestMaybeLazyFetchFromRemote_FullTableDrainsOnReads(t *testing.T) {
@@ -216,20 +217,19 @@ func TestMaybeLazyFetchFromRemote_FullTableDrainsOnReads(t *testing.T) {
 		},
 	}
 	f, store := newMountedTestFiler(t, storageType, stub, 0)
+	tombs := f.remoteTombstones.table("/buckets/mybucket", true)
 	remoteDeletionTombstoneLimit = 2
 	t.Cleanup(func() { remoteDeletionTombstoneLimit = defaultRemoteDeletionTombstoneLimit })
 	now := time.Now().UnixNano()
 	tsA, tsB, tsC := now-3*int64(time.Second), now-2*int64(time.Second), now-int64(time.Second)
 
-	// a confirmed delete on another mount, then two on this one fill the
-	// table; a third on this mount is unrecorded and closes the fetch
-	remoteDeletionTombstoneLimit = 3
-	f.remoteTombstones.addFromEvent("/buckets/other/dir/z.txt", false, tsA, tsA)
-	f.remoteTombstones.addFromEvent("/buckets/mybucket/dir/a.txt", false, tsA, tsA)
-	f.remoteTombstones.addFromEvent("/buckets/mybucket/dir/b.txt", false, tsB, tsB)
-	f.remoteTombstones.addFromEvent("/buckets/mybucket/dir/c.txt", false, tsC, tsC)
-	assert.True(t, f.remoteTombstones.isFull())
-	assert.Len(t, f.remoteTombstones.files, 3)
+	// two confirmed deletes fill the table; a third is unrecorded and
+	// closes the fetch
+	tombs.addFromEvent("/buckets/mybucket/dir/a.txt", false, tsA, tsA)
+	tombs.addFromEvent("/buckets/mybucket/dir/b.txt", false, tsB, tsB)
+	tombs.addFromEvent("/buckets/mybucket/dir/c.txt", false, tsC, tsC)
+	assert.True(t, tombs.isFull())
+	assert.Len(t, tombs.files, 2)
 
 	// the write-back offset behind the recorded deletes: a read drains
 	// nothing and the fetch stays off
@@ -238,32 +238,69 @@ func TestMaybeLazyFetchFromRemote_FullTableDrainsOnReads(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, entry)
 	assert.Equal(t, 0, stub.statCalls)
-	assert.Len(t, f.remoteTombstones.files, 3)
+	assert.Len(t, tombs.files, 2)
 
-	// the offset past both recorded deletes of this mount: the read drains
-	// them without any mutation; the other mount's tombstone answers to its
-	// own offset and stays; the unrecorded delete is still inside the TTL,
-	// so the fetch stays off
+	// the offset past both recorded deletes: the read drains them without
+	// any mutation; the unrecorded delete is still inside the TTL, so the
+	// fetch stays off
 	putRemoteSyncOffset(t, store, "/buckets/mybucket", tsB)
 	entry, err = f.maybeLazyFetchFromRemote(context.Background(), "/buckets/mybucket/dir/other.txt")
 	require.NoError(t, err)
 	assert.Nil(t, entry)
 	assert.Equal(t, 0, stub.statCalls)
-	assert.Len(t, f.remoteTombstones.files, 1)
-	_, otherKept := f.remoteTombstones.files["/buckets/other/dir/z.txt"]
-	assert.True(t, otherKept, "another mount's tombstone must not be released by this mount's offset")
-	assert.True(t, f.remoteTombstones.isFull())
+	assert.Empty(t, tombs.files)
+	assert.True(t, tombs.isFull())
 
 	// once the unrecorded delete has aged past the TTL the next read lifts
 	// the gate
-	f.remoteTombstones.mu.Lock()
-	f.remoteTombstones.skippedThroughTsNs = now - int64(remoteDeletionTombstoneTTL) - 1
-	f.remoteTombstones.mu.Unlock()
+	tombs.mu.Lock()
+	tombs.skippedThroughTsNs = now - int64(remoteDeletionTombstoneTTL) - 1
+	tombs.mu.Unlock()
 	entry, err = f.maybeLazyFetchFromRemote(context.Background(), "/buckets/mybucket/dir/other.txt")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.NotZero(t, stub.statCalls)
-	assert.False(t, f.remoteTombstones.isFull())
+	assert.False(t, tombs.isFull())
+}
+
+func TestMaybeLazyFetchFromRemote_FullTableKeepsOtherMountsFetching(t *testing.T) {
+	const storageType = "stub_tomb_other_mount"
+	stub := &countingRemoteClient{
+		stubRemoteClient: stubRemoteClient{
+			statResult: &filer_pb.RemoteEntry{RemoteMtime: 1700000000, RemoteSize: 11},
+		},
+	}
+	f, _ := newMountedTestFiler(t, storageType, stub, 0)
+	f.RemoteStorage.mapDirectoryToRemoteStorage("/buckets/other", &remote_pb.RemoteStorageLocation{
+		Name: "tombstonestore", Bucket: "other", Path: "/",
+	})
+	remoteDeletionTombstoneLimit = 2
+	t.Cleanup(func() { remoteDeletionTombstoneLimit = defaultRemoteDeletionTombstoneLimit })
+
+	now := time.Now().UnixNano()
+	f.noteRemoteDeletion("/buckets/mybucket/dir/a.txt", false, now)
+	f.noteRemoteDeletion("/buckets/mybucket/dir/b.txt", false, now)
+	f.noteRemoteDeletion("/buckets/mybucket/dir/c.txt", false, now)
+	require.True(t, f.remoteTombstones.table("/buckets/mybucket", false).isFull())
+
+	entry, err := f.maybeLazyFetchFromRemote(context.Background(), "/buckets/mybucket/dir/other.txt")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+	assert.Equal(t, 0, stub.statCalls)
+
+	// the other mount has its own room: its deletes are still recorded and
+	// block, and a lookup miss for any other path still consults the remote
+	f.noteRemoteDeletion("/buckets/other/dir/x.txt", false, now)
+	assert.False(t, f.remoteTombstones.table("/buckets/other", false).isFull())
+	entry, err = f.maybeLazyFetchFromRemote(context.Background(), "/buckets/other/dir/x.txt")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+	assert.Equal(t, 0, stub.statCalls)
+
+	entry, err = f.maybeLazyFetchFromRemote(context.Background(), "/buckets/other/dir/y.txt")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.NotZero(t, stub.statCalls)
 }
 
 func TestMaybeLazyFetchFromRemote_SkipsTombstonedPath(t *testing.T) {
@@ -519,7 +556,7 @@ func TestMaybeLazyListFromRemote_RecreatedDirStillHidesChildren(t *testing.T) {
 	assert.Nil(t, store.getEntry("/buckets/mybucket/dir/fresh.txt"))
 
 	// after the write-back daemon confirms the remote delete, listing merges again
-	f.remoteTombstones.releaseThrough("/buckets/mybucket/dir/stale.txt", deleteTs)
+	f.remoteTombstones.table("/buckets/mybucket", false).releaseThrough("/buckets/mybucket/dir/stale.txt", deleteTs)
 	delete(store.getEntry("/buckets/mybucket/dir").Extended, xattrRemoteListingSyncedAt)
 	f.maybeLazyListFromRemote(context.Background(), util.FullPath("/buckets/mybucket/dir"))
 	assert.NotNil(t, store.getEntry("/buckets/mybucket/dir/stale.txt"))
@@ -564,7 +601,7 @@ func TestRebuildRemoteDeletionTombstones_EmptyLogReleasesGate(t *testing.T) {
 		t.Fatal("rebuild never released the gate")
 	}
 	assert.Nil(t, f.remoteTombstonesDone.Load())
-	_, ts, _ := f.remoteTombstones.blockedSince("/buckets/mybucket/a.txt")
+	_, ts, _ := f.remoteTombstones.table("/buckets/mybucket", false).blockedSince("/buckets/mybucket/a.txt")
 	assert.Zero(t, ts)
 }
 

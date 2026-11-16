@@ -309,8 +309,8 @@ func (f *Filer) deleteSweptChild(ctx context.Context, sub *Entry, message *filer
 		return true, nil
 	}
 	if !keepRemote && f.RemoteStorage != nil && f.remoteTombstones != nil {
-		if _, remoteLoc := f.RemoteStorage.FindMountDirectory(sub.FullPath); remoteLoc != nil {
-			f.remoteTombstones.addFromEvent(string(sub.FullPath), sub.IsDirectory(), commitTsNs, streamTsNs)
+		if mountDir, remoteLoc := f.RemoteStorage.FindMountDirectory(sub.FullPath); remoteLoc != nil {
+			f.remoteTombstones.table(mountDir, true).addFromEvent(string(sub.FullPath), sub.IsDirectory(), commitTsNs, streamTsNs)
 		}
 	}
 	if deleteRemote && !sub.IsDirectory() {

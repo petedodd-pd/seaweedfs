@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -21,8 +22,9 @@ const (
 	// sync offset ever confirms the remote delete. A remote object re-created
 	// outside the filer at a deleted path stays hidden for this long.
 	defaultRemoteDeletionTombstoneTTL = 24 * time.Hour
-	// defaultRemoteDeletionTombstoneLimit bounds tracked paths; at the cap a
-	// new delete is not recorded and the lazy fetch stays off instead.
+	// defaultRemoteDeletionTombstoneLimit bounds tracked paths per mount; at
+	// the cap a new delete is not recorded and the mount's lazy fetch stays
+	// off instead.
 	defaultRemoteDeletionTombstoneLimit = 1 << 16
 )
 
@@ -53,12 +55,14 @@ type remoteDeletionTombstone struct {
 }
 
 type remoteDeletionTombstones struct {
-	mu      sync.Mutex
-	files   map[string]remoteDeletionTombstone // file path -> delete event
-	dirs    map[string]remoteDeletionTombstone // deleted directory path -> event; covers its subtree
-	pending map[string]bool                    // tombstone path recorded ahead of its event
+	mu       sync.Mutex
+	mountDir util.FullPath
+	files    map[string]remoteDeletionTombstone // file path -> delete event
+	dirs     map[string]remoteDeletionTombstone // deleted directory path -> event; covers its subtree
+	pending  map[string]bool                    // tombstone path recorded ahead of its event
 	// full is set when a delete could not be recorded: from then on an
-	// unrecorded path may be a pending delete, so every lazy fetch stays off.
+	// unrecorded path under the mount may be a pending delete, so every lazy
+	// fetch under it stays off.
 	// It lifts once the table has room and the newest unrecorded delete is
 	// past the TTL (skippedThroughTsNs): an unrecorded delete has no event
 	// to confirm it, so only the TTL makes it safe, as for a pending one.
@@ -68,6 +72,10 @@ type remoteDeletionTombstones struct {
 	// drain released through, so a read repeats the sweep only once the
 	// offset has advanced.
 	drainedOffsets map[string]int64
+	// size and fullNow mirror the table for the mounts' shared gauges.
+	size     atomic.Int64
+	fullNow  atomic.Bool
+	observed func()
 }
 
 // isFull reports whether an unrecorded delete still keeps the lazy fetch off.
@@ -136,12 +144,57 @@ func (t *remoteDeletionTombstones) observeLocked() {
 		t.full = false
 		t.skippedThroughTsNs = 0
 	}
-	stats.FilerRemoteDeletionTombstones.Set(float64(size))
-	if t.full {
-		stats.FilerRemoteDeletionTombstonesFull.Set(1)
-	} else {
-		stats.FilerRemoteDeletionTombstonesFull.Set(0)
+	t.size.Store(int64(size))
+	t.fullNow.Store(t.full)
+	if t.observed != nil {
+		t.observed()
 	}
+}
+
+// remoteDeletionTombstoneMounts keeps one tombstone table per remote mount,
+// so a mount whose deletes fill its table turns off only its own lazy fetch.
+type remoteDeletionTombstoneMounts struct {
+	mu     sync.Mutex
+	tables map[util.FullPath]*remoteDeletionTombstones
+}
+
+func newRemoteDeletionTombstoneMounts() *remoteDeletionTombstoneMounts {
+	return &remoteDeletionTombstoneMounts{tables: make(map[util.FullPath]*remoteDeletionTombstones)}
+}
+
+// table returns mountDir's tombstones, creating them when create is set; nil
+// otherwise, which every table method treats as an empty table.
+func (m *remoteDeletionTombstoneMounts) table(mountDir util.FullPath, create bool) *remoteDeletionTombstones {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.tables[mountDir]
+	if t == nil && create {
+		t = newRemoteDeletionTombstones()
+		t.mountDir = mountDir
+		t.observed = m.publish
+		m.tables[mountDir] = t
+	}
+	return t
+}
+
+// publish sets the gauges across mounts: the total size, and full while any
+// mount's table is full.
+func (m *remoteDeletionTombstoneMounts) publish() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var size int64
+	full := 0.0
+	for _, t := range m.tables {
+		size += t.size.Load()
+		if t.fullNow.Load() {
+			full = 1
+		}
+	}
+	stats.FilerRemoteDeletionTombstones.Set(float64(size))
+	stats.FilerRemoteDeletionTombstonesFull.Set(full)
 }
 
 func newRemoteDeletionTombstones() *remoteDeletionTombstones {
@@ -209,7 +262,7 @@ func (t *remoteDeletionTombstones) upsert(path string, isDir bool, commitTsNs, s
 		t.evictExpiredLocked(time.Now().UnixNano())
 		if len(t.files)+len(t.dirs) >= remoteDeletionTombstoneLimit {
 			if !t.full {
-				glog.V(0).Infof("remote deletion tombstones full (%d), lazy remote fetch off until the table has room and the unrecorded deletes age out; first skipped %s", remoteDeletionTombstoneLimit, path)
+				glog.V(0).Infof("remote deletion tombstones for %s full (%d), its lazy remote fetch is off until the table has room and the unrecorded deletes age out; first skipped %s", t.mountDir, remoteDeletionTombstoneLimit, path)
 			}
 			t.full = true
 			if commitTsNs > t.skippedThroughTsNs {
@@ -383,39 +436,50 @@ func (f *Filer) noteRemoteDeletion(p util.FullPath, isDir bool, tsNs int64) {
 	if f.RemoteStorage == nil || f.remoteTombstones == nil {
 		return
 	}
-	if _, remoteLoc := f.RemoteStorage.FindMountDirectory(p); remoteLoc == nil {
+	mountDir, remoteLoc := f.RemoteStorage.FindMountDirectory(p)
+	if remoteLoc == nil {
 		return
 	}
-	f.remoteTombstones.add(string(p), isDir, tsNs)
+	f.remoteTombstones.table(mountDir, true).add(string(p), isDir, tsNs)
 }
 
 // unnoteRemoteDeletion retracts a tombstone when the delete that recorded it
 // fails before touching anything under path.
 func (f *Filer) unnoteRemoteDeletion(p util.FullPath, tsNs int64) {
-	if f.remoteTombstones == nil {
-		return
+	f.remoteTombstonesFor(p).drop(string(p), tsNs)
+}
+
+// remoteTombstonesFor returns the tombstones of the mount holding p, or nil.
+func (f *Filer) remoteTombstonesFor(p util.FullPath) *remoteDeletionTombstones {
+	if f.RemoteStorage == nil || f.remoteTombstones == nil {
+		return nil
 	}
-	f.remoteTombstones.drop(string(p), tsNs)
+	mountDir, remoteLoc := f.RemoteStorage.FindMountDirectory(p)
+	if remoteLoc == nil {
+		return nil
+	}
+	return f.remoteTombstones.table(mountDir, false)
 }
 
 // isRemoteDeletionPending reports whether a remote write-back delete for p is
 // still owed: p was deleted under mountDir and neither a rewrite, the mount's
 // sync offset, nor the TTL has lifted the tombstone.
 func (f *Filer) isRemoteDeletionPending(ctx context.Context, p util.FullPath, mountDir util.FullPath) bool {
-	if f.remoteTombstones == nil {
+	tombs := f.remoteTombstones.table(mountDir, false)
+	if tombs == nil {
 		return false
 	}
-	// With deletes unrecorded, any path may be one: no lazy fetch resurrects
-	// it until the table has room again and the unrecorded deletes aged out.
-	// Reads keep the table draining meanwhile.
-	if f.remoteTombstones.isFull() {
+	// With deletes unrecorded, any path under the mount may be one: no lazy
+	// fetch resurrects it until the table has room again and the unrecorded
+	// deletes aged out. Reads keep the table draining meanwhile.
+	if tombs.isFull() {
 		offset, err := f.readRemoteSyncOffset(ctx, mountDir)
-		f.remoteTombstones.drain(string(mountDir), time.Now().UnixNano(), offset, err == nil)
-		if f.remoteTombstones.isFull() {
+		tombs.drain(string(mountDir), time.Now().UnixNano(), offset, err == nil)
+		if tombs.isFull() {
 			return true
 		}
 	}
-	streamTsNs, commitTsNs, pending := f.remoteTombstones.blockedSince(string(p))
+	streamTsNs, commitTsNs, pending := tombs.blockedSince(string(p))
 	if commitTsNs == 0 {
 		return false
 	}
@@ -423,13 +487,13 @@ func (f *Filer) isRemoteDeletionPending(ctx context.Context, p util.FullPath, mo
 		// Recorded ahead of its delete event — the write-back offset cannot
 		// vouch for it yet; only the TTL lifts it.
 		if f.remoteDeletionExpired(commitTsNs) {
-			f.remoteTombstones.releaseExpired(string(p), time.Now().UnixNano())
+			tombs.releaseExpired(string(p), time.Now().UnixNano())
 			return false
 		}
 		return true
 	}
 	if f.remoteDeletionConsumed(ctx, mountDir, streamTsNs) {
-		f.remoteTombstones.releaseThrough(string(p), streamTsNs)
+		tombs.releaseThrough(string(p), streamTsNs)
 		return false
 	}
 	return true
@@ -571,13 +635,14 @@ func (f *Filer) onRemoteDeletionEvents(event *filer_pb.SubscribeMetadataResponse
 		sourcePath := filer_pb.MetadataEventSourceFullPath(event)
 		if message.NewEntry == nil || sourcePath != filer_pb.MetadataEventTargetFullPath(event) {
 			if f.RemoteStorage != nil && f.remoteTombstones != nil {
-				if _, remoteLoc := f.RemoteStorage.FindMountDirectory(util.FullPath(sourcePath)); remoteLoc != nil {
-					f.remoteTombstones.addFromEvent(sourcePath, message.OldEntry.IsDirectory, commitTsNs, event.TsNs)
+				if mountDir, remoteLoc := f.RemoteStorage.FindMountDirectory(util.FullPath(sourcePath)); remoteLoc != nil {
+					f.remoteTombstones.table(mountDir, true).addFromEvent(sourcePath, message.OldEntry.IsDirectory, commitTsNs, event.TsNs)
 				}
 			}
 		}
 	}
 	if message.NewEntry != nil {
-		f.remoteTombstones.clear(filer_pb.MetadataEventTargetFullPath(event), commitTsNs)
+		targetPath := filer_pb.MetadataEventTargetFullPath(event)
+		f.remoteTombstonesFor(util.FullPath(targetPath)).clear(targetPath, commitTsNs)
 	}
 }
